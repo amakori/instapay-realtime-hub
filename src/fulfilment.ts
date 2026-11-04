@@ -332,6 +332,105 @@ async function createFleetbaseOrder(transaction: any): Promise<FleetbaseOrder> {
   };
 }
 
+async function createShopFleetbaseOrder(
+  order: any,
+  authorization: any,
+  product: any,
+  creator: any,
+  pickup: any,
+  delivery: any
+): Promise<FleetbaseOrder> {
+  const apiKey = process.env.FLEETBASE_API_KEY;
+  if (!apiKey) throw new FulfilmentError(503, 'Fleetbase is not configured. Set FLEETBASE_API_KEY before approving a shop order.');
+  if (!pickup?.pickup_address || !pickup?.pickup_phone ||
+      !Number.isFinite(Number(pickup.pickup_latitude)) || !Number.isFinite(Number(pickup.pickup_longitude))) {
+    throw new FulfilmentError(409, 'The creator pickup details are incomplete.');
+  }
+  if (!delivery?.delivery_address || !delivery?.recipient_phone ||
+      !Number.isFinite(Number(delivery.delivery_latitude)) || !Number.isFinite(Number(delivery.delivery_longitude))) {
+    throw new FulfilmentError(409, 'The buyer delivery details are incomplete.');
+  }
+
+  const response = await fetch(process.env.FLEETBASE_ORDERS_URL || 'https://api.fleetbase.io/v1/orders', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+      'Idempotency-Key': `sumthin-shop-${order.id}`
+    },
+    body: JSON.stringify({
+      reference: order.id,
+      external_id: order.id,
+      payload: {
+        pickup: {
+          name: pickup.pickup_name || creator.display_name,
+          phone: pickup.pickup_phone,
+          address: pickup.pickup_address,
+          location: {
+            latitude: Number(pickup.pickup_latitude),
+            longitude: Number(pickup.pickup_longitude)
+          }
+        },
+        dropoff: {
+          name: delivery.recipient_name,
+          phone: delivery.recipient_phone,
+          address: delivery.delivery_address,
+          location: {
+            latitude: Number(delivery.delivery_latitude),
+            longitude: Number(delivery.delivery_longitude)
+          }
+        },
+        entities: [{
+          description: product.name,
+          quantity: Number(order.quantity),
+          value: Number(authorization.amount),
+          currency: 'ZMW'
+        }],
+        instructions: 'Deliver this Sumthin creator shop purchase to the buyer. Fleetbase should dispatch its configured Shipday integration for pickup and delivery, and report shipment updates through the Fleetbase webhook.',
+        metadata: {
+          sumthin_creator_order_id: order.id,
+          salary_payment_authorization_id: authorization.id,
+          buyer: {
+            name: delivery.recipient_name,
+            phone: delivery.recipient_phone,
+            destination: { address: delivery.delivery_address }
+          },
+          seller: {
+            name: creator.display_name,
+            phone: pickup.pickup_phone,
+            pickup: { address: pickup.pickup_address }
+          }
+        }
+      },
+      metadata: {
+        sumthin_creator_order_id: order.id,
+        salary_payment_authorization_id: authorization.id,
+        sumthin_order_type: 'creator_shop'
+      }
+    })
+  });
+  const result = await response.json().catch(() => null) as Record<string, any> | null;
+  if (!response.ok || result?.success === false || result?.errors?.length) {
+    console.error('[Fulfilment] Fleetbase shop order creation failed:', response.status, result);
+    throw new FulfilmentError(502, 'Fleetbase could not accept this shop delivery. No delivery was marked as booked.');
+  }
+  const remoteOrder = result?.data?.attributes || result?.data || result?.order || result;
+  const orderId = remoteOrder?.id ?? result?.data?.id ?? remoteOrder?.uuid ?? remoteOrder?.public_id;
+  if (orderId === undefined || orderId === null) {
+    console.error('[Fulfilment] Fleetbase shop response did not contain an order ID:', result);
+    throw new FulfilmentError(502, 'Fleetbase returned no order ID. The shop delivery was not marked as booked.');
+  }
+  const trackingNumber = remoteOrder.tracking_number || remoteOrder.trackingNumber ||
+    result?.data?.attributes?.tracking_number;
+  const trackingUrl = remoteOrder.tracking_url || remoteOrder.trackingUrl || remoteOrder.tracking_link ||
+    (trackingNumber ? `${(process.env.FLEETBASE_CONSOLE_URL || 'https://console.fleetbase.io').replace(/\/+$/, '')}/~/track-order?order=${encodeURIComponent(String(trackingNumber))}` : null);
+  return {
+    orderId: String(orderId),
+    status: String(remoteOrder.status || 'created'),
+    trackingUrl: trackingUrl ? String(trackingUrl) : null
+  };
+}
+
 function fleetbaseTransactionStatus(stage: string, currentStatus: string): string | null {
   const normalized = stage.toLowerCase().replace(/[\s.-]+/g, '_');
   const statuses: Record<string, string> = {
@@ -656,6 +755,130 @@ export function createFulfilmentRouter(io: SocketIOServer): Router {
     }));
   }));
 
+  router.get('/mfi/shop-orders', route(async (req, res) => {
+    await requireMfiOperator(req);
+    const { data: authorizations, error: authorizationError } = await db().from('salary_payment_authorizations')
+      .select('id, user_id, salary_application_id, amount, quantity, status, created_at')
+      .eq('payment_type', 'shop_order')
+      .order('created_at', { ascending: false })
+      .limit(200);
+    if (authorizationError) throw new FulfilmentError(502, 'Could not load Sumthin shop payments.');
+    const authorizationIds = (authorizations || []).map(item => item.id);
+    const { data: orders, error: orderError } = authorizationIds.length
+      ? await db().from('creator_orders').select('*').in('payment_authorization_id', authorizationIds)
+      : { data: [], error: null };
+    if (orderError) throw new FulfilmentError(502, 'Could not load Sumthin shop orders.');
+    const orderRows = orders || [];
+    const productIds = [...new Set(orderRows.map(item => item.product_id))];
+    const creatorIds = [...new Set(orderRows.map(item => item.creator_id))];
+    const applicationIds = [...new Set((authorizations || []).map(item => item.salary_application_id))];
+    const [productResult, creatorResult, pickupResult, deliveryResult, applicationResult] = await Promise.all([
+      productIds.length
+        ? db().from('creator_products').select('id, name, description, creator_id').in('id', productIds)
+        : Promise.resolve({ data: [], error: null }),
+      creatorIds.length
+        ? db().from('creator_profiles').select('id, display_name').in('id', creatorIds)
+        : Promise.resolve({ data: [], error: null }),
+      creatorIds.length
+        ? db().from('creator_fulfilment_profiles').select('creator_id, pickup_name, pickup_phone, pickup_address').in('creator_id', creatorIds)
+        : Promise.resolve({ data: [], error: null }),
+      orderRows.length
+        ? db().from('creator_order_deliveries').select('*').in('order_id', orderRows.map(item => item.id))
+        : Promise.resolve({ data: [], error: null }),
+      applicationIds.length
+        ? db().from('salary_applications').select('id, applicant_first_name, applicant_last_name, employment_number').in('id', applicationIds)
+        : Promise.resolve({ data: [], error: null })
+    ]);
+    const referenceError = productResult.error || creatorResult.error || pickupResult.error || deliveryResult.error || applicationResult.error;
+    if (referenceError) throw new FulfilmentError(502, 'Could not load shop-order details.');
+    const authorizationById = new Map((authorizations || []).map(item => [item.id, item]));
+    const productById = new Map((productResult.data || []).map(item => [item.id, item]));
+    const creatorById = new Map((creatorResult.data || []).map(item => [item.id, item]));
+    const pickupByCreatorId = new Map((pickupResult.data || []).map(item => [item.creator_id, item]));
+    const deliveryByOrderId = new Map((deliveryResult.data || []).map(item => [item.order_id, item]));
+    const applicationById = new Map((applicationResult.data || []).map(item => [item.id, item]));
+    res.json(orderRows.map(order => {
+      const authorization = authorizationById.get(order.payment_authorization_id);
+      const application = authorization ? applicationById.get(authorization.salary_application_id) : null;
+      return {
+        ...order,
+        authorization,
+        product: productById.get(order.product_id) || null,
+        creator: creatorById.get(order.creator_id) || null,
+        pickup: pickupByCreatorId.get(order.creator_id) || null,
+        delivery_name: deliveryByOrderId.get(order.id)?.recipient_name || null,
+        delivery_phone: deliveryByOrderId.get(order.id)?.recipient_phone || null,
+        delivery_address: deliveryByOrderId.get(order.id)?.delivery_address || null,
+        customer: application ? {
+          name: `${application.applicant_first_name} ${application.applicant_last_name}`,
+          employment_number: application.employment_number
+        } : null
+      };
+    }));
+  }));
+
+  router.post('/mfi/shop-orders/:id/approve', route(async (req, res) => {
+    const operator = await requireMfiOperator(req);
+    const { data: order, error: orderError } = await db().from('creator_orders')
+      .select('*')
+      .eq('id', req.params.id)
+      .maybeSingle();
+    if (orderError) throw new FulfilmentError(502, 'Could not load the shop order.');
+    if (!order) throw new FulfilmentError(404, 'Shop order not found.');
+    if (!order.payment_authorization_id) {
+      throw new FulfilmentError(409, 'This shop order has no authorized customer payment.');
+    }
+    const { data: authorization, error: authorizationError } = await db().from('salary_payment_authorizations')
+      .select('id, salary_application_id, amount, quantity, status, payment_type')
+      .eq('id', order.payment_authorization_id)
+      .maybeSingle();
+    if (authorizationError) throw new FulfilmentError(502, 'Could not load the shop payment.');
+    if (!authorization || authorization.payment_type !== 'shop_order' || authorization.status !== 'authorized') {
+      throw new FulfilmentError(409, 'This shop payment is not available for MFI approval.');
+    }
+
+    if (order.mfi_approved_at && order.fleetbase_order_id) {
+      res.json({ success: true, order_id: order.fleetbase_order_id, status: order.fulfilment_status, duplicate: true });
+      return;
+    }
+    if (!['requested', 'accepted'].includes(order.status)) {
+      throw new FulfilmentError(409, 'This shop order is no longer awaiting MFI fulfilment approval.');
+    }
+
+    const [{ data: product, error: productError }, { data: creator, error: creatorError }, { data: pickup, error: pickupError }, { data: delivery, error: deliveryError }] = await Promise.all([
+      db().from('creator_products').select('id, name, creator_id').eq('id', order.product_id).maybeSingle(),
+      db().from('creator_profiles').select('id, display_name').eq('id', order.creator_id).maybeSingle(),
+      db().from('creator_fulfilment_profiles').select('*').eq('creator_id', order.creator_id).maybeSingle(),
+      db().from('creator_order_deliveries').select('*').eq('order_id', order.id).maybeSingle()
+    ]);
+    if (productError || creatorError || pickupError || deliveryError) throw new FulfilmentError(502, 'Could not load the shop fulfilment details.');
+    if (!product || !creator || !pickup || !delivery) throw new FulfilmentError(409, 'The creator pickup or buyer delivery details are incomplete.');
+
+    const fleetbase = order.fleetbase_order_id
+      ? { orderId: order.fleetbase_order_id, status: order.fleetbase_status || 'created', trackingUrl: order.fleetbase_tracking_url || null }
+      : await createShopFleetbaseOrder(order, authorization, product, creator, pickup, delivery);
+    const { data: updatedOrder, error: updateError } = await db().from('creator_orders')
+      .update({
+        status: 'accepted',
+        mfi_approved_at: order.mfi_approved_at || new Date().toISOString(),
+        mfi_approved_by: order.mfi_approved_by || operator.id,
+        fulfilment_status: order.fulfilment_status === 'awaiting_mfi' ? 'delivery_pending' : order.fulfilment_status,
+        fleetbase_order_id: fleetbase.orderId,
+        fleetbase_status: fleetbase.status,
+        fleetbase_tracking_url: fleetbase.trackingUrl,
+        fleetbase_updated_at: new Date().toISOString()
+      })
+      .eq('id', order.id)
+      .in('status', ['requested', 'accepted'])
+      .select('id')
+      .maybeSingle();
+    if (updateError || !updatedOrder) {
+      console.error('[Fulfilment] Fleetbase accepted the Sumthin shop order, but its order ID could not be saved:', fleetbase.orderId, updateError?.message);
+      throw new FulfilmentError(502, 'Fleetbase accepted the shop order, but the MFI approval could not be saved. Retry safely or contact support.');
+    }
+    res.json({ success: true, order_id: fleetbase.orderId, status: 'delivery_pending' });
+  }));
+
   router.post('/mfi/loans/:id/review', route(async (req, res) => {
     const operator = await requireMfiOperator(req);
     const decision = req.body.decision;
@@ -846,6 +1069,71 @@ export function createFulfilmentRouter(io: SocketIOServer): Router {
     const metadata = data?.metadata || data?.payload?.metadata || req.body?.metadata || {};
     const reference = metadata.trustea_transaction_id || data?.external_id || data?.reference || data?.order_number;
     const remoteOrderId = data?.id || req.body?.data?.id || req.body?.order_id;
+    const eventName = String(req.body?.event || req.body?.type || '');
+    const stage = String(
+      data?.trustea_stage ||
+      data?.stage ||
+      metadata.trustea_stage ||
+      data?.activity?.code ||
+      data?.activity?.name ||
+      data?.status ||
+      eventName
+    );
+    const shopOrderReference = metadata.sumthin_creator_order_id ||
+      metadata.creator_order_id ||
+      (metadata.sumthin_order_type === 'creator_shop' ? reference : null);
+    if (typeof shopOrderReference === 'string' && /^[0-9a-f-]{36}$/i.test(shopOrderReference)) {
+      const { data: shopOrder, error: shopLoadError } = await db().from('creator_orders')
+        .select('id, status, fulfilment_status, fleetbase_order_id, fleetbase_status, fleetbase_tracking_url, fleetbase_updated_at, delivered_at')
+        .eq('id', shopOrderReference)
+        .maybeSingle();
+      if (shopLoadError) throw new FulfilmentError(502, 'Could not load the Sumthin shop order.');
+      if (!shopOrder || !shopOrder.fleetbase_order_id) throw new FulfilmentError(404, 'No active Sumthin shop order matches this Fleetbase event.');
+      if (remoteOrderId !== undefined && String(remoteOrderId) !== shopOrder.fleetbase_order_id) {
+        throw new FulfilmentError(409, 'Fleetbase order ID does not match the Sumthin shop order.');
+      }
+      const shopTimeValue = req.body?.created_at || data?.updated_at || req.body?.timestamp;
+      const parsedShopTime = typeof shopTimeValue === 'number'
+        ? new Date(shopTimeValue > 1e12 ? shopTimeValue : shopTimeValue * 1000)
+        : shopTimeValue ? new Date(shopTimeValue) : new Date();
+      const shopEventAt = Number.isNaN(parsedShopTime.getTime()) ? new Date() : parsedShopTime;
+      if (shopOrder.fleetbase_updated_at &&
+          new Date(shopOrder.fleetbase_updated_at).getTime() > shopEventAt.getTime()) {
+        res.json({ success: true, ignored: 'stale_event' });
+        return;
+      }
+      const normalizedShopStage = stage.toLowerCase().replace(/[\s.-]+/g, '_');
+      const nextShopStatus = ['order_completed', 'completed', 'delivered', 'final_delivery_completed', 'recipient_handover'].includes(normalizedShopStage)
+        ? 'delivered'
+        : fleetbaseTransactionStatus(stage, shopOrder.fulfilment_status) || shopOrder.fulfilment_status;
+      const trackingUrl = data?.tracking_url || data?.trackingUrl || data?.tracking_link ||
+        shopOrder.fleetbase_tracking_url;
+      const { data: updatedShopOrder, error: shopUpdateError } = await db().from('creator_orders')
+        .update({
+          fulfilment_status: nextShopStatus,
+          status: nextShopStatus === 'delivered' ? 'fulfilled' : shopOrder.status,
+          fleetbase_status: String(data?.status || eventName || stage),
+          fleetbase_tracking_url: trackingUrl,
+          fleetbase_updated_at: shopEventAt.toISOString(),
+          ...(data?.shipday_order_id || metadata.shipday_order_id
+            ? { shipday_order_id: String(data?.shipday_order_id || metadata.shipday_order_id) }
+            : {}),
+          ...(data?.shipday_tracking_url || metadata.shipday_tracking_url
+            ? { shipday_tracking_url: String(data?.shipday_tracking_url || metadata.shipday_tracking_url) }
+            : {}),
+          ...(data?.shipday_status || metadata.shipday_status
+            ? { shipday_status: String(data?.shipday_status || metadata.shipday_status) }
+            : {}),
+          delivered_at: nextShopStatus === 'delivered' ? shopOrder.delivered_at || shopEventAt.toISOString() : shopOrder.delivered_at
+        })
+        .eq('id', shopOrder.id)
+        .eq('fleetbase_order_id', shopOrder.fleetbase_order_id)
+        .select('id')
+        .maybeSingle();
+      if (shopUpdateError || !updatedShopOrder) throw new FulfilmentError(502, 'Could not save the Fleetbase shop-order update.');
+      res.json({ success: true, status: nextShopStatus });
+      return;
+    }
     const query = db().from('fulfilment_transactions').select('*');
     const { data: transaction, error: loadError } = typeof reference === 'string' && /^[0-9a-f-]{36}$/i.test(reference)
       ? await query.eq('id', reference).maybeSingle()
@@ -858,16 +1146,6 @@ export function createFulfilmentRouter(io: SocketIOServer): Router {
       throw new FulfilmentError(409, 'Fleetbase order ID does not match the Trustea transaction.');
     }
 
-    const eventName = String(req.body?.event || req.body?.type || '');
-    const stage = String(
-      data?.trustea_stage ||
-      data?.stage ||
-      metadata.trustea_stage ||
-      data?.activity?.code ||
-      data?.activity?.name ||
-      data?.status ||
-      eventName
-    );
     const nextStatus = fleetbaseTransactionStatus(stage, transaction.status);
     const rawStatus = String(data?.status || eventName || stage);
     const timeValue = req.body?.created_at || data?.updated_at || req.body?.timestamp;

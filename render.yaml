@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: instapay-realtime-hub
+    runtime: node
+    plan: starter
+    numInstances: 1
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: FULFILMENT_TOKEN_ENCRYPTION_KEY
+        sync: false
+      - key: FULFILMENT_APP_URL
+        sync: false
+      - key: CUSTOMER_APP_URL
+        sync: false
