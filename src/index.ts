@@ -28,7 +28,7 @@ import {
 
 const app = express();
 const server = http.createServer(app);
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 8080;
 
 // CORS setup for both web apps (MFI Software & Customer App) and Android clients
 app.use(cors({ origin: '*' }));
