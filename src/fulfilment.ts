@@ -1,8 +1,8 @@
-import { createHash, randomBytes, timingSafeEqual, createCipheriv, createDecipheriv } from 'crypto';
+import { createHash, createHmac, randomBytes, randomInt, timingSafeEqual, createCipheriv, createDecipheriv } from 'crypto';
 import { Router, Request, Response, NextFunction, RequestHandler } from 'express';
 import { Server as SocketIOServer, Socket } from 'socket.io';
 import { v4 as uuidv4 } from 'uuid';
-import { SUPABASE_ANON_KEY, SUPABASE_URL, supabaseAdmin } from './supabaseClient';
+import { supabaseAdmin } from './supabaseClient';
 
 type Role = 'buyer' | 'seller';
 type LocationInput =
@@ -86,8 +86,6 @@ function equalHash(left: string, right: string): boolean {
 
 type AuthenticatedTrusteaUser = {
   id: string;
-  accessToken: string;
-  claims: { aal?: string; amr?: unknown } | null;
 };
 
 async function authenticateTrusteaUser(req: Request): Promise<AuthenticatedTrusteaUser> {
@@ -96,14 +94,7 @@ async function authenticateTrusteaUser(req: Request): Promise<AuthenticatedTrust
   const { data, error } = await db().auth.getUser(match[1]);
   if (error || !data.user) throw new FulfilmentError(401, 'Your sign-in has expired. Sign in again.');
 
-  let claims: AuthenticatedTrusteaUser['claims'] = null;
-  try {
-    const payload = match[1].split('.')[1];
-    if (payload) claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
-  } catch {
-    claims = null;
-  }
-  return { id: data.user.id, accessToken: match[1], claims };
+  return { id: data.user.id };
 }
 
 function verifyFleetbaseWebhookToken(req: Request): void {
@@ -608,42 +599,22 @@ async function requireMfiOperator(req: Request): Promise<{ id: string }> {
   return { id: data.user.id };
 }
 
-async function requirePhoneMfa(req: Request, factorIdValue: unknown): Promise<{ id: string; phone: string }> {
-  const user = await authenticateTrusteaUser(req);
-  if (user.claims?.aal !== 'aal2') {
-    throw new FulfilmentError(403, 'Verify your phone with its SMS code before using the BuySafe inbox.');
-  }
-  const methods = Array.isArray(user.claims.amr) ? user.claims.amr : [];
-  const latestMethod = methods.length ? methods[methods.length - 1] : null;
-  const method = typeof latestMethod === 'string'
-    ? latestMethod
-    : latestMethod && typeof latestMethod === 'object' && 'method' in latestMethod &&
-      typeof latestMethod.method === 'string' ? latestMethod.method : '';
-  if (!['otp', 'phone', 'sms'].includes(method)) {
-    throw new FulfilmentError(403, 'Verify your phone with its SMS code before using the BuySafe inbox.');
-  }
+function phoneCodeHash(challengeId: string, code: string): string {
+  return createHmac('sha256', encryptionKey()).update(`${challengeId}:${code}`).digest('hex');
+}
 
-  const factorId = requireText(factorIdValue, 'verified phone factor', 80);
-  const { data: phoneFactor, error: phoneFactorError } = await db().from('fulfilment_mfa_phone_factors')
-    .select('factor_id, phone')
+async function requirePhoneVerification(req: Request): Promise<{ id: string; phone: string }> {
+  const user = await authenticateTrusteaUser(req);
+  const { data: phoneFactor, error: phoneFactorError } = await db().from('fulfilment_verified_phones')
+    .select('phone_id, phone')
     .eq('user_id', user.id)
     .maybeSingle();
   if (phoneFactorError) {
     console.error('[Fulfilment] Could not load BuySafe phone factor:', phoneFactorError.message);
     throw new FulfilmentError(502, 'Could not verify your BuySafe phone factor.');
   }
-  if (!phoneFactor || phoneFactor.factor_id !== factorId) {
-    throw new FulfilmentError(403, 'Use the phone factor registered for your BuySafe account.');
-  }
-  const { data: factorData, error: factorError } = await db().auth.admin.mfa.listFactors({ userId: user.id });
-  if (factorError) {
-    console.error('[Fulfilment] Could not verify phone factor:', factorError.message);
-    throw new FulfilmentError(502, 'Could not verify your BuySafe phone factor.');
-  }
-  const factor = factorData.factors.find((item) =>
-    item.id === factorId && item.factor_type === 'phone' && item.status === 'verified');
-  if (!factor) {
-    throw new FulfilmentError(403, 'Verify a phone SMS factor before using the BuySafe inbox.');
+  if (!phoneFactor) {
+    throw new FulfilmentError(403, 'Verify a phone number before using the BuySafe inbox.');
   }
 
   return { id: user.id, phone: normalizePhone(phoneFactor.phone, 'verified phone number') };
@@ -671,98 +642,153 @@ export function createFulfilmentRouter(io: SocketIOServer): Router {
 
   router.get('/phone-factor', route(async (req, res) => {
     const user = await authenticateTrusteaUser(req);
-    const { data: savedFactor, error: savedFactorError } = await db().from('fulfilment_mfa_phone_factors')
-      .select('factor_id, phone')
+    const { data: savedFactor, error: savedFactorError } = await db().from('fulfilment_verified_phones')
+      .select('phone_id, phone')
       .eq('user_id', user.id)
       .maybeSingle();
     if (savedFactorError) {
       console.error('[Fulfilment] Could not load BuySafe phone setup:', savedFactorError.message);
       throw new FulfilmentError(502, 'Could not load your BuySafe phone setup.');
     }
-    if (!savedFactor) {
-      res.json(null);
-      return;
-    }
-    const { data: factors, error: factorsError } = await db().auth.admin.mfa.listFactors({ userId: user.id });
-    if (factorsError) {
-      console.error('[Fulfilment] Could not check BuySafe phone setup:', factorsError.message);
-      throw new FulfilmentError(502, 'Could not check your BuySafe phone setup.');
-    }
-    if (!factors.factors.some((factor) => factor.id === savedFactor.factor_id && factor.factor_type === 'phone')) {
-      const { error: deleteError } = await db().from('fulfilment_mfa_phone_factors').delete().eq('user_id', user.id);
-      if (deleteError) {
-        console.error('[Fulfilment] Could not remove stale BuySafe phone setup:', deleteError.message);
-        throw new FulfilmentError(502, 'Your old BuySafe phone setup could not be cleared.');
-      }
-      res.json(null);
-      return;
-    }
-    res.json({ factor_id: savedFactor.factor_id, phone: savedFactor.phone });
+    res.json(savedFactor ? { phone_id: savedFactor.phone_id, phone: savedFactor.phone } : null);
   }));
 
-  router.post('/phone-factor', route(async (req, res) => {
+  router.post('/phone-factor/challenge', route(async (req, res) => {
     const user = await authenticateTrusteaUser(req);
-    const phone = normalizePhone(req.body.phone, 'phone number');
-    if (!/^\+[1-9]\d{7,14}$/.test(phone)) {
-      throw new FulfilmentError(400, 'Enter the phone in international format, for example +260XXXXXXXXX.');
-    }
-    if (!SUPABASE_ANON_KEY || SUPABASE_ANON_KEY === '******') {
-      throw new FulfilmentError(503, 'Set SUPABASE_ANON_KEY on the hub to enroll a BuySafe phone factor.');
-    }
-    const { data: existingFactor, error: existingFactorError } = await db().from('fulfilment_mfa_phone_factors')
-      .select('factor_id, phone')
+    const { data: existingFactor, error: existingFactorError } = await db().from('fulfilment_verified_phones')
+      .select('phone_id, phone')
       .eq('user_id', user.id)
       .maybeSingle();
     if (existingFactorError) {
       console.error('[Fulfilment] Could not check existing BuySafe phone factor:', existingFactorError.message);
       throw new FulfilmentError(502, 'Could not check your BuySafe phone setup.');
     }
+    const phone = existingFactor
+      ? normalizePhone(existingFactor.phone, 'verified phone number')
+      : normalizePhone(req.body.phone, 'phone number');
+    if (!/^\+[1-9]\d{7,14}$/.test(phone)) {
+      throw new FulfilmentError(400, 'Enter the phone in international format, for example +260XXXXXXXXX.');
+    }
     if (existingFactor) {
-      res.json({ factor_id: existingFactor.factor_id, phone: existingFactor.phone });
-      return;
+      const requestedPhone = typeof req.body.phone === 'string'
+        ? normalizePhone(req.body.phone, 'phone number')
+        : phone;
+      if (requestedPhone !== phone) {
+        throw new FulfilmentError(403, 'BuySafe verification codes can only be sent to your already verified phone number.');
+      }
     }
 
-    const response = await fetch(`${SUPABASE_URL.replace(/\/+$/, '')}/auth/v1/factors`, {
-      method: 'POST',
-      headers: {
-        apikey: SUPABASE_ANON_KEY,
-        Authorization: `Bearer ${user.accessToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ factor_type: 'phone', phone, friendly_name: 'BuySafe SMS verification' }),
-    });
-    const result: unknown = await response.json().catch(() => null);
-    const returnedFactorId = result && typeof result === 'object' && 'id' in result ? result.id : null;
-    if (!response.ok) {
-      const reason = result && typeof result === 'object' && 'msg' in result && typeof result.msg === 'string'
-        ? result.msg
-        : 'Could not enroll your BuySafe phone factor.';
-      throw new FulfilmentError(response.status >= 400 && response.status < 500 ? response.status : 502, reason);
+    const recentCutoff = new Date(Date.now() - 60_000).toISOString();
+    const { data: recentChallenge, error: recentError } = await db().from('fulfilment_phone_challenges')
+      .select('id')
+      .eq('user_id', user.id)
+      .gt('created_at', recentCutoff)
+      .limit(1)
+      .maybeSingle();
+    if (recentError) {
+      console.error('[Fulfilment] Could not check BuySafe SMS rate limit:', recentError.message);
+      throw new FulfilmentError(502, 'Could not check the SMS verification rate limit.');
     }
-    if (typeof returnedFactorId !== 'string' || !/^[0-9a-f-]{36}$/i.test(returnedFactorId)) {
-      throw new FulfilmentError(502, 'Supabase returned an invalid BuySafe phone factor.');
-    }
-    const { error: saveError } = await db().from('fulfilment_mfa_phone_factors').insert({
+    if (recentChallenge) throw new FulfilmentError(429, 'Wait one minute before requesting another verification code.');
+
+    const challengeId = uuidv4();
+    const code = String(randomInt(100000, 1000000));
+    const { error: challengeError } = await db().from('fulfilment_phone_challenges').insert({
+      id: challengeId,
       user_id: user.id,
-      factor_id: returnedFactorId,
       phone,
+      code_hash: phoneCodeHash(challengeId, code),
+      expires_at: new Date(Date.now() + 10 * 60_000).toISOString(),
     });
-    if (saveError) {
-      console.error('[Fulfilment] Could not save BuySafe phone factor:', saveError.message);
-      const { error: cleanupError } = await db().auth.admin.mfa.deleteFactor({
-        id: returnedFactorId,
-        userId: user.id,
-      });
-      if (cleanupError) {
-        console.error('[Fulfilment] Could not remove unlinked BuySafe phone factor:', cleanupError.message);
-      }
-      throw new FulfilmentError(502, 'The phone factor was created but could not be linked to your BuySafe account.');
+    if (challengeError) {
+      console.error('[Fulfilment] Could not create BuySafe phone challenge:', challengeError.message);
+      throw new FulfilmentError(502, 'Could not create a phone verification challenge.');
     }
-    res.status(201).json({ factor_id: returnedFactorId, phone });
+    try {
+      await queueSms(phone, `Your Trustea BuySafe verification code is ${code}. It expires in 10 minutes. Do not share it.`, challengeId, 'buysafe_phone_verification');
+    } catch (error) {
+      const { error: deleteError } = await db().from('fulfilment_phone_challenges').delete().eq('id', challengeId);
+      if (deleteError) console.error('[Fulfilment] Could not remove unsent BuySafe phone challenge:', deleteError.message);
+      throw error;
+    }
+    res.status(201).json({ challenge_id: challengeId, phone });
+  }));
+
+  router.post('/phone-factor/verify', route(async (req, res) => {
+    const user = await authenticateTrusteaUser(req);
+    const challengeId = requireText(req.body.challenge_id, 'verification challenge', 80);
+    const code = requireText(req.body.code, 'verification code', 12);
+    if (!/^\d{6}$/.test(code)) throw new FulfilmentError(400, 'Enter the six-digit verification code.');
+    const { data: challenge, error: challengeError } = await db().from('fulfilment_phone_challenges')
+      .select('id, phone, code_hash, attempts, expires_at, verified_at')
+      .eq('id', challengeId)
+      .eq('user_id', user.id)
+      .maybeSingle();
+    if (challengeError) {
+      console.error('[Fulfilment] Could not load BuySafe phone challenge:', challengeError.message);
+      throw new FulfilmentError(502, 'Could not verify the phone challenge.');
+    }
+    if (!challenge || challenge.verified_at || new Date(challenge.expires_at).getTime() <= Date.now() ||
+        challenge.attempts >= 5) {
+      throw new FulfilmentError(400, 'This verification code has expired or is no longer available. Request another code.');
+    }
+    if (!equalHash(phoneCodeHash(challengeId, code), challenge.code_hash)) {
+      const { error: attemptError } = await db().from('fulfilment_phone_challenges')
+        .update({ attempts: challenge.attempts + 1 })
+        .eq('id', challengeId)
+        .eq('user_id', user.id);
+      if (attemptError) {
+        console.error('[Fulfilment] Could not record BuySafe verification attempt:', attemptError.message);
+        throw new FulfilmentError(502, 'Could not record the verification attempt.');
+      }
+      throw new FulfilmentError(400, 'That verification code is incorrect.');
+    }
+
+    const { data: existingFactor, error: existingFactorError } = await db().from('fulfilment_verified_phones')
+      .select('phone_id, phone')
+      .eq('user_id', user.id)
+      .maybeSingle();
+    if (existingFactorError) {
+      console.error('[Fulfilment] Could not check verified BuySafe phone:', existingFactorError.message);
+      throw new FulfilmentError(502, 'Could not verify your saved phone.');
+    }
+    if (existingFactor && normalizePhone(existingFactor.phone, 'verified phone number') !== challenge.phone) {
+      throw new FulfilmentError(403, 'This account is already linked to a different verified phone number.');
+    }
+    const phoneId = existingFactor?.phone_id || uuidv4();
+    const { data: verifiedChallenge, error: verifiedError } = await db().from('fulfilment_phone_challenges')
+      .update({
+        verified_at: new Date().toISOString(),
+      })
+      .eq('id', challengeId)
+      .eq('user_id', user.id)
+      .is('verified_at', null)
+      .select('id')
+      .maybeSingle();
+    if (verifiedError) {
+      console.error('[Fulfilment] Could not save BuySafe phone verification:', verifiedError.message);
+      throw new FulfilmentError(502, 'Phone verification could not be saved.');
+    }
+    if (!verifiedChallenge) {
+      throw new FulfilmentError(400, 'This verification code has already been used. Request another code if needed.');
+    }
+
+    if (!existingFactor) {
+      const { error: saveError } = await db().from('fulfilment_verified_phones').insert({
+        user_id: user.id,
+        phone_id: phoneId,
+        phone: challenge.phone,
+      });
+      if (saveError) {
+        console.error('[Fulfilment] Could not save verified BuySafe phone:', saveError.message);
+        throw new FulfilmentError(502, 'The code was verified but the phone could not be linked to your account.');
+      }
+    }
+    res.json({ phone_id: phoneId, phone: challenge.phone });
   }));
 
   router.get('/transactions/inbox', route(async (req, res) => {
-    const participant = await requirePhoneMfa(req, req.query.factor_id);
+    const participant = await requirePhoneVerification(req);
     const { data, error } = await db().from('fulfilment_transactions')
       .select('id, buyer_user_id, seller_user_id, buyer_token_ciphertext, seller_token_ciphertext')
       .or(`buyer_user_id.eq.${participant.id},seller_user_id.eq.${participant.id}`)
@@ -782,7 +808,7 @@ export function createFulfilmentRouter(io: SocketIOServer): Router {
   }));
 
   router.post('/transactions', route(async (req, res) => {
-    const participant = await requirePhoneMfa(req, req.body.phone_factor_id);
+    const participant = await requirePhoneVerification(req);
     const buyerName = requireText(req.body.buyer_name, 'buyer name', 100);
     const sellerPhone = normalizePhone(req.body.seller_phone, 'seller phone number');
     const id = uuidv4();
@@ -827,7 +853,7 @@ export function createFulfilmentRouter(io: SocketIOServer): Router {
   }));
 
   router.post('/transactions/:id/link', route(async (req, res) => {
-    const participant = await requirePhoneMfa(req, req.body.phone_factor_id);
+    const participant = await requirePhoneVerification(req);
     const id = requireText(req.params.id, 'transaction link', 80);
     const suppliedToken = requireText(req.body.token, 'private transaction link', 200);
     const transaction = await loadTransaction(id);
